@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 """Defines BaseLayer, the base class for layer implementations."""
+
 import dataclasses
 import math
 from typing import Any, Callable, Dict, Optional, Sequence, Union
@@ -345,7 +346,11 @@ class BaseLayer(Module):
             param_spec = dataclasses.replace(
                 param_spec,
                 mesh_axes=PartitionSpec(*partition_spec),
-                fan_axes=self._compute_fan_axes(name=name, parameter_spec=param_spec),
+                fan_axes=(
+                    param_spec.fan_axes
+                    if param_spec.fan_axes is not None
+                    else self._compute_fan_axes(name=name, parameter_spec=param_spec)
+                ),
             )
             if param_spec.dtype is None:
                 param_spec = dataclasses.replace(param_spec, dtype=self.dtype())
@@ -459,14 +464,13 @@ class BaseLayer(Module):
             params = self._param_noise.apply(prng_key, params)
         return params
 
-    # pylint: disable-next=no-self-use
     def _compute_fan_axes(self, name: str, parameter_spec: ParameterSpec) -> Optional[FanAxes]:
         if not name.endswith("weight"):
             return None
-        if len(parameter_spec.shape) < 2:
+        if len(parameter_spec.shape) != 2:
             raise NotImplementedError(
-                "Default _compute_fan_axes requires weight parameters to have at least 2 axes "
-                f"shape({name}) = {parameter_spec.shape}"
+                f"{type(self)} uses the default _compute_fan_axes, which requires weight "
+                f"parameters to have exactly 2 axes: shape({name}) = {parameter_spec.shape}"
             )
         return FanAxes(in_axis=-2, out_axis=-1)
 
