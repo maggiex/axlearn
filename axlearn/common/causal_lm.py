@@ -266,8 +266,8 @@ class Model(BaseModel):
                 hidden_states: a float Tensor of shape [batch_size, seq_len, hidden_dim]
         """
         self._constrain_input_batch(input_batch)
-        # input_ids: Tensor = input_batch["input_ids"]
-        input_ids: Tensor = input_batch["prefix"]  # Using "prefix" for instruct_lm sft inferencing
+        input_ids: Tensor = input_batch["input_ids"]
+        # input_ids: Tensor = input_batch["prefix"]  # Using "prefix" for instruct_lm sft inferencing
         token_type_ids: Tensor = input_batch.get("token_type_ids")
         # Decoder hidden states: [batch_size, target_len, hidden_dim].
         decoder_output = self.decoder(
