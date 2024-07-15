@@ -45,7 +45,6 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 # tpu_library_init_fns.inc:98] TpuEmbeddingEngine_ExecutePartitioner not available in this library.
 import jax  # jax must be imported before tensorflow!
 
-print(f"env={os.environ}", file=sys.stderr)
 print(f"jax version={jax.__version__}", file=sys.stderr)
 if instance_type != "none":
     print(f"instance_type={instance_type} num_slices={num_tpu_slices}", file=sys.stderr)
@@ -70,7 +69,7 @@ flags.DEFINE_integer("status_port", None, "If not None, the status server port."
 flags.DEFINE_string("jax_backend", None, "Specifies the XLA backend to use.", required=True)
 flags.DEFINE_string(
     "distributed_coordinator",
-    None,
+    os.environ.get("DISTRIBUTED_COORDINATOR", None),
     "Distributed coordinator IP address. Must be None on tpu, otherwise required.",
 )
 flags.DEFINE_integer(
@@ -79,10 +78,14 @@ flags.DEFINE_integer(
     "Distributed initialization timeout in seconds. If None, uses jax default.",
 )
 flags.DEFINE_integer(
-    "num_processes", None, "Total number of hosts (nodes). Must be None on tpu, otherwise required."
+    "num_processes",
+    os.environ.get("NUM_PROCESSES", None),
+    "Total number of hosts (nodes). Must be None on tpu, otherwise required.",
 )
 flags.DEFINE_integer(
-    "process_id", None, "Rank of the current process. Must be None on tpu, otherwise required."
+    "process_id",
+    os.environ.get("PROCESS_ID", None),
+    "Rank of the current process. Must be None on tpu, otherwise required.",
 )
 
 

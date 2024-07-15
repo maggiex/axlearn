@@ -11,7 +11,7 @@ See c4_trainer.py for how they are used.
 """
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Sequence, Tuple, Union
 
 import jax.numpy as jnp
 import tensorflow as tf
@@ -29,9 +29,7 @@ from axlearn.common import (
     state_builder,
 )
 from axlearn.common.attention import (
-    AttentionLogitBiasLayer,
     BaseQKVLinear,
-    CausalAttentionLogitBiasLayer,
     FusedQKVLinear,
     MultiheadAttention,
     RepeatedTransformerLayer,
@@ -41,6 +39,7 @@ from axlearn.common.attention import (
 )
 from axlearn.common.checkpointer import every_n_steps_policy
 from axlearn.common.config import (
+    ConfigOr,
     FunctionConfigBase,
     InstantiableConfig,
     config_for_function,
@@ -56,7 +55,7 @@ from axlearn.common.layers import BaseNormalizationLayer, set_bias_recursively, 
 from axlearn.common.param_init import PARAM_REGEXP_WEIGHT, DefaultInitializer, WeightInitializer
 from axlearn.common.summary_writer import BaseWriter
 from axlearn.common.trainer import MeshShape, SpmdTrainer
-from axlearn.common.utils import get_data_dir
+from axlearn.common.utils import HybridMeshShape, Nested, get_data_dir
 from axlearn.experiments.text.common import DataMixtureComponent, tfds_text_source
 from axlearn.experiments.trainer_config_utils import TrainerConfigFn
 
@@ -71,7 +70,7 @@ STEP_DTYPE = jnp.bfloat16
 
 # The default mesh-axis names for LM training, from least to most communication intensive.
 # See mesh_shape_from_axes() docstring for more details.
-MESH_AXIS_NAMES = ("data", "expert", "fsdp", "seq", "model")
+MESH_AXIS_NAMES = ("pipeline", "data", "expert", "fsdp", "seq", "model")
 
 
 def scaled_hidden_dim(scale: float, *, round_up_to_multiples_of: int = 256) -> FunctionConfigBase:
@@ -150,11 +149,19 @@ def tfds_input(
 
 
 def mesh_shape_from_axes(
-    *, data: int = 1, expert: int = 1, fsdp: int = 1, seq: int = 1, model: int = 1
+    *,
+    pipeline: int = 1,
+    data: int = 1,
+    expert: int = 1,
+    fsdp: int = 1,
+    seq: int = 1,
+    model: int = 1,
 ) -> Sequence[int]:
     """Builds a 5D logical mesh from the provided spec.
 
     Args:
+        pipeline: Pipeline-paralellism. Typically means partitioning model layers across this axis.
+            E.g. <https://arxiv.org/abs/1811.06965>.
         data: For data-parallelism. Expect model state to be fully replicated over this axis.
             Useful for e.g. multi-slice/granule partitioning with slow networking between granules.
         expert: Designed to be used for partitioning "experts" in mixture-of-expert models.
@@ -169,9 +176,9 @@ def mesh_shape_from_axes(
     Returns:
         A tuple describing the logical mesh shape (from least to most communication intensive).
     """
-    assert MESH_AXIS_NAMES == ("data", "expert", "fsdp", "seq", "model")
+    assert MESH_AXIS_NAMES == ("pipeline", "data", "expert", "fsdp", "seq", "model")
     # We set the minimum size for a mesh axis to 1 as anything lower is degenerate, except -1.
-    return tuple((max(x, 1) if x != -1 else -1 for x in [data, expert, fsdp, seq, model]))
+    return tuple((max(x, 1) if x != -1 else -1 for x in [pipeline, data, expert, fsdp, seq, model]))
 
 
 def model_config(
@@ -186,7 +193,6 @@ def model_config(
     dropout_rate: float = 0.0,
     stack_cfg: causal_lm.TransformerStackConfig = RepeatedTransformerLayer.default_config(),
     emb_cfg: TransformerTextEmbeddings.Config = TransformerTextEmbeddings.default_config(),
-    attention_mask: AttentionLogitBiasLayer.Config = CausalAttentionLogitBiasLayer.default_config(),
     attention_cfg: MultiheadAttention.Config = MultiheadAttention.default_config(),
     attention_qkv_linear: Optional[BaseQKVLinear.Config] = FusedQKVLinear.default_config(),
     z_loss_scale: float = 0.0,
@@ -209,7 +215,6 @@ def model_config(
             Defaults to 0.0 (i.e. no dropout).
         stack_cfg: The transformer stack config.
         emb_cfg: The Transformer embedding layer config.
-        attention_mask: The AttentionLogitBiasLayer config.
         attention_qkv_linear: The attention QKV linear layer.
         z_loss_scale: The scalar weight for the z-loss to encourages the cross-entropy loss
             normalizer to be well-behaved.
@@ -231,6 +236,7 @@ def model_config(
     # Attention.
     if attention_cfg is not None:
         layer_cfg.self_attention.attention = attention_cfg
+    layer_cfg.self_attention.attention.causal = True
     layer_cfg.self_attention.attention.num_heads = num_heads
     if attention_qkv_linear is not None:
         layer_cfg.self_attention.attention.input_linear = attention_qkv_linear
@@ -246,10 +252,10 @@ def model_config(
                 stack_cfg, feed_forward=True, self_attention=True
             )
     # Stack.
-    transformer_cls = stack_cfg.set(num_layers=num_layers, layer=layer_cfg)
+    transformer_cfg = stack_cfg.set(num_layers=num_layers, layer=layer_cfg)
     decoder_cfg = Decoder.default_config().set(
-        transformer=transformer_cls,
-        attention_mask=attention_mask,
+        transformer=transformer_cfg,
+        attention_mask=None,
         dim=hidden_dim,
         vocab_size=vocab_size,
         emb=emb_cfg,
@@ -472,7 +478,9 @@ def evaler_config_dict(
     return evalers
 
 
-def make_config_name(arch: str, model_size: str, version: Optional[str] = None) -> str:
+def make_config_name(
+    arch: str, model_size: str, *, version: Optional[str] = None, suffix: Optional[str] = None
+) -> str:
     """Makes config name string as a function of architecture and model-size.
 
     Useful to keep config names synced with fine-tuning configs.
@@ -481,13 +489,18 @@ def make_config_name(arch: str, model_size: str, version: Optional[str] = None) 
         arch: The architecture of the model.
         model_size: The number of transformer parameters (not including vocab embeddings).
         version: An optional version string.
+        suffix: Optional config suffix.
 
     Returns:
-        f"{arch}-{model_size}" or f"{arch}-{model_size}-{version}".
+        f"{arch}-{model_size}".
+        If version is supplied, a f"-{version}" suffix will be appended.
+        If suffix is supplied, it will be appended last (without any delimiter).
     """
     name = f"{arch}-{model_size}"
     if version:
         name += f"-{version}"
+    if suffix:
+        name += suffix
     return name
 
 
@@ -497,11 +510,11 @@ def get_trainer_config_fn(
     learner_cfg: learner.Learner.Config,
     max_step: int,
     train_batch_size: int,
-    mesh_shape: Sequence[int],
     train_input_source: InstantiableConfig[input_tf_data.BuildDatasetFn],
     evalers: Dict[str, SpmdEvaler.Config],
+    mesh_shape: Union[MeshShape, HybridMeshShape],
     mesh_axis_names: Sequence[str] = MESH_AXIS_NAMES,
-    mesh_rules: Optional[Sequence[Tuple[str, Optional[MeshShape]]]] = None,
+    mesh_rules: Optional[Sequence[Tuple[str, Optional[Union[MeshShape, HybridMeshShape]]]]] = None,
     eval_every_n_steps: int = 5000,
     eval_batch_size: Optional[int] = None,
     keep_every_n_steps: int = 50_000,
@@ -515,11 +528,11 @@ def get_trainer_config_fn(
         learner_cfg: The learner config.
         max_step: The maximum number of training steps.
         train_batch_size: The global batch size for training inputs.
-        mesh_shape: The mesh shape.
         train_input_source: A config (often constructed via `tfds_input` or
             `mixture_train_input_source`) that instantiates to a BuildDatasetFn.
         evalers: A dict whose keys represent evaler names and values are configs
             that each instantiates to a SpmdEvaler.
+        mesh_shape: The mesh shape.
         mesh_axis_names: The mesh axis names.
         mesh_rules: Optional rules to use different mesh shapes based on the mesh_selector.
         eval_every_n_steps: How often to run evaluation.
@@ -535,7 +548,7 @@ def get_trainer_config_fn(
     """
 
     def config_fn() -> InstantiableConfig:
-        cfg = SpmdTrainer.default_config()
+        cfg: SpmdTrainer.Config = SpmdTrainer.default_config()
         cfg.name = "gpt_trainer"
         cfg.model = model_cfg
         cfg.learner = learner_cfg
@@ -565,14 +578,18 @@ def get_trainer_config_fn(
         cfg.checkpointer.keep_every_n_steps = min(max_step, keep_every_n_steps)
         cfg.checkpointer.keep_last_n = 3
         cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 100)
-        if mesh_shape:
-            assert len(mesh_axis_names) == len(
-                mesh_shape
-            ), f"Len mismatch: {mesh_axis_names} vs. {mesh_shape}"
-            cfg.mesh_axis_names = mesh_axis_names
-            cfg.mesh_shape = mesh_shape
-            # Set batch sharding spec to exclude the "model" axis (assumed for tensor-parallelism).
-            cfg.batch_axis_names = tuple(el for el in mesh_axis_names if el != "model")
+        if len(mesh_axis_names) != len(mesh_shape):
+            raise ValueError(
+                f"Number of mesh axis names ({mesh_axis_names}) "
+                f"must match number of mesh dims ({mesh_shape})."
+            )
+        cfg.mesh_axis_names = mesh_axis_names
+        cfg.mesh_shape = mesh_shape
+        # Set batch sharding spec to exclude the "model" axis (assumed for tensor-parallelism) and
+        # "pipeline" axis (for pipeline parallelism).
+        cfg.batch_axis_names = tuple(
+            el for el in mesh_axis_names if el not in ("model", "pipeline")
+        )
         cfg.mesh_rules = mesh_rules
         # Maybe load state.
         if init_state_builder:
@@ -580,3 +597,12 @@ def get_trainer_config_fn(
         return cfg
 
     return config_fn
+
+
+class SourceBuilder(Protocol):
+    """A protocol that builds an input source."""
+
+    def __call__(
+        self, *, vocab_size: int, max_sequence_length: int
+    ) -> Nested[ConfigOr[input_tf_data.BuildDatasetFn]]:
+        raise NotImplementedError(type(self))

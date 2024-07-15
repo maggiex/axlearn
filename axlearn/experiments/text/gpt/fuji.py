@@ -9,12 +9,15 @@ The fuji models are set up to imitate LLaMA models:
 * LLaMA 2: https://arxiv.org/abs/2307.09288
 * LLaMA 3: https://github.com/meta-llama/llama3
 """
+
 import enum
+import functools
+import itertools
 from typing import Any, Dict, Optional, Union
 
 from axlearn.common import causal_lm, config
 from axlearn.common.attention import (
-    CausalAttentionLogitBiasLayer,
+    BaseStackedTransformerLayer,
     FusedGroupedQKVLinear,
     FusedQKVLinear,
     GroupedQueryAttention,
@@ -24,14 +27,20 @@ from axlearn.common.attention import (
 )
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.layers import RMSNorm
+from axlearn.common.trainer import SpmdTrainer
 from axlearn.experiments.text.gpt.common import (
     STEP_DTYPE,
+    SourceBuilder,
+    evaler_config_dict,
     flash_attention_config,
+    get_trainer_config_fn,
     learner_config,
+    make_config_name,
     mesh_shape_from_axes,
 )
 from axlearn.experiments.text.gpt.common import model_config as common_model_config
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
+from axlearn.experiments.trainer_config_utils import TrainerConfigFn
 
 MODEL_SIZES = ("test", "7B", "70B")
 
@@ -165,7 +174,7 @@ def get_trainer_kwargs(
                 # Without sequence sharding, the maximum number of devices <= batch_size,
                 # so at most 512 GPUs (64 nodes) for training 7B-v3.
                 (
-                    "gpu-(p5.48xlarge|p4de.24xlarge)-(256|512|1024)",
+                    "gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g)-(256|512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=8),
                 ),
             ),
@@ -221,6 +230,7 @@ def model_config(
     dropout_rate: float = 0.0,
     ffn_dim: Optional[Union[int, config.FunctionConfigBase]] = None,
     flash_attention: bool = False,
+    stack_cfg: Optional[BaseStackedTransformerLayer.Config] = None,
 ) -> causal_lm.Model.Config:
     """Returns an LM model config based on the given hyperparams.
 
@@ -235,6 +245,9 @@ def model_config(
             Defaults to 0.0 (i.e. no dropout).
         ffn_dim: The feed-forward dimension or config function.
             If None, defaults to a setting from https://arxiv.org/abs/2002.05202.
+        flash_attention: Whether to enable flash attention.
+        stack_cfg: The transformer stack config.
+            If None, defaults to a RepeatedTransformerLayer.
 
     Returns:
         A causal LM config.
@@ -263,14 +276,100 @@ def model_config(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         vocab_size=vocab_size,
-        stack_cfg=RepeatedTransformerLayer.default_config(),
+        stack_cfg=stack_cfg if stack_cfg is not None else RepeatedTransformerLayer.default_config(),
         activation_fn=activation_fn,
         ffn_dim=ffn_dim,
         normalization=RMSNorm.default_config().set(eps=1e-5, forward_dtype=None),
         dropout_rate=dropout_rate,
         emb_cfg=TransformerTextEmbeddings.default_config().set(pos_emb=None),
-        attention_mask=None if flash_attention else CausalAttentionLogitBiasLayer.default_config(),
         attention_cfg=flash_attention_config() if flash_attention else atten_cfg,
         attention_qkv_linear=atten_qkv_linear,
     )
     return cfg
+
+
+def trainer_configs(
+    train_input_source: SourceBuilder, eval_input_sources: SourceBuilder
+) -> Dict[str, TrainerConfigFn]:
+    """Returns a mapping from config_name to TrainerConfigFn's.
+
+    Args:
+        train_input_source: A callable (vocab_size, max_sequence_length) -> input source config.
+        eval_input_soruces: A callable (vocab_size, max_sequence_length) -> eval input sources.
+    """
+    arch = "fuji"
+    config_map = {}
+    for version, model_size, flash_attention in itertools.product(
+        Version, MODEL_SIZES, [True, False]
+    ):
+        vocab_size = VOCAB_SIZE[version]
+        config_name = make_config_name(
+            arch=arch,
+            model_size=model_size,
+            version=f"v{version.value}",
+            suffix="-flash" if flash_attention else "",
+        )
+        kwargs = get_trainer_kwargs(
+            model_size, vocab_size=vocab_size, version=version, flash_attention=flash_attention
+        )
+        max_sequence_length = kwargs.pop("max_sequence_length")
+        # pylint: disable-next=unexpected-keyword-arg,missing-kwoa
+        config_map[config_name] = get_trainer_config_fn(
+            train_input_source=train_input_source(
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+            ),
+            evalers=evaler_config_dict(
+                eval_input_sources(vocab_size=vocab_size, max_sequence_length=max_sequence_length),
+            ),
+            **kwargs,
+        )
+        if model_size == "test":
+
+            def wrapper(config_name: str = config_name):
+                trainer_cfg: SpmdTrainer.Config = config_map[config_name]()
+                trainer_cfg.max_step = 5
+                # Make learning rate large to accentuate any differences.
+                trainer_cfg.learner.optimizer.args[1].learning_rate = 0.3
+                trainer_cfg.learner.optimizer.args[1].update_schedule = 1
+                trainer_cfg.vlog = 1
+                return trainer_cfg
+
+            config_map[
+                make_config_name(
+                    arch=arch, model_size="golden-run-test", version=f"v{version.value}"
+                )
+            ] = wrapper
+        if model_size == "7B":
+
+            def make_single_host_config(base_config_name: str) -> SpmdTrainer.Config:
+                """Make a single-host variant of the base config.
+
+                gpu-p5.48xlarge 8x1 step time:
+                128K tokens per batch: 2.03s for v1.
+                64K tokens per batch:  1.1s for v1, 1.54s for v2.
+
+                tpu-v5litepod-32 step time:
+                128K tokens per batch: 1.93s for v1.
+
+                Args:
+                    base_config_name: The multi-host config name.
+
+                Returns:
+                    A trainer config that can run on a single host.
+                """
+
+                # pytype: disable=annotation-type-mismatch
+                cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
+                # pytype: enable=annotation-type-mismatch
+
+                # The original config was supposed to run on >= 32 machines.
+                cfg.input.batcher.global_batch_size //= 32
+                for evaler in cfg.evalers.values():
+                    evaler.input.batcher.global_batch_size //= 32
+                return cfg
+
+            config_map[f"{config_name}-single-host"] = functools.partial(
+                make_single_host_config, config_name
+            )
+    return config_map
