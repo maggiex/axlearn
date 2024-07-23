@@ -15,10 +15,27 @@ _module_root = "axlearn"
 
 
 # pylint: disable=wrong-import-position
-from axlearn.open_api.common import ClientRateLimitError, Generator
+from axlearn.open_api.common import ClientRateLimitError, Generator, ValidationError
 from axlearn.open_api.openai import OpenAIClient
 
 # pylint: enable=wrong-import-position
+
+
+class TestOpenAIClient(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for class OpenAIClient."""
+
+    def setUp(self):
+        self.client: OpenAIClient = (
+            OpenAIClient.default_config().set(model="gpt-3.5-turbo").instantiate()
+        )
+        self.client._client = AsyncMock()
+
+    async def test_async_generate_raises_validation_error(self):
+        request = {}
+        with self.assertRaises(ValidationError) as context:
+            await self.client.async_generate(request=request)
+
+        self.assertEqual(str(context.exception), "Both prompt and messages are None.")
 
 
 class TestOpenAIAsyncGenerateFromRequests(unittest.IsolatedAsyncioTestCase):
@@ -61,7 +78,10 @@ class TestOpenAIAsyncGenerateFromRequests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response["response"], "test response")  # Validate response content
 
         # Check if async_generate_from_request is called correctly.
-        calls = [unittest.mock.call(client=ANY, request=ANY) for i in range(len(mock_requests))]
+        calls = [
+            unittest.mock.call(client=ANY, request=ANY, **self.open_api.config.decode_parameters)
+            for _ in range(len(mock_requests))
+        ]
         mock_async_generate_from_request.assert_has_calls(
             calls, any_order=True
         )  # Ensure each request is processed

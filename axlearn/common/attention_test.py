@@ -100,6 +100,7 @@ from axlearn.common.param_init import (
     FanAxes,
     WeightInitializer,
 )
+from axlearn.common.pipeline import BaseSchedule, GPipeSchedule, StreamSchedule
 from axlearn.common.test_utils import TestCase, assert_allclose, dummy_segments_positions
 from axlearn.common.torch_utils import parameters_from_torch_layer
 from axlearn.common.utils import (
@@ -1908,6 +1909,15 @@ class MultiheadAttentionTest(TestCase):
             attention.GroupedQueryAttention.default_config().set(
                 input_linear=attention.RoFormerQKVLinear.default_config().set(rotary_value=False)
             ),
+            attention.SigmoidAttention.default_config().set(
+                input_linear=attention.RoFormerQKVLinear.default_config().set(rotary_value=False),
+                seq_len=4,
+            ),
+            attention.SigmoidAttention.default_config().set(
+                # Used in ALiBi position encoding.
+                input_linear=FusedQKVLinear.default_config(),
+                seq_len=4,
+            ),
         ),
         attention_logit_biases_fn=(
             lambda seq_len: None,
@@ -2543,6 +2553,72 @@ class MultiheadAttentionTest(TestCase):
         self.assertIn(str(query_scale_factor), hlo)
         self.assertIn(str(key_scale_factor), hlo)
         self.assertNotIn(str(query_scale_factor * key_scale_factor), hlo)
+
+    @parameterized.parameters(
+        [
+            (
+                1.0,
+                jax.nn.sigmoid((1.0 * 1.0) * 2 - jnp.log(6)),
+                6,
+            ),
+            (
+                1.0,
+                jax.nn.sigmoid((1.0 * 1.0) * 2 - jnp.log(4)),
+                4,
+            ),
+            (
+                2.0,
+                jax.nn.sigmoid((2.0 * 2.0) * 2 - jnp.log(6)),
+                6,
+            ),
+        ]
+    )
+    def test_sigmoid_compute_attention(self, qkv_value: float, expected_value: float, seq_len: int):
+        model_dim = 16
+        num_heads = 4
+        batch_size = 2
+        init_key = jax.random.PRNGKey(123)
+
+        cfg = attention.SigmoidAttention.default_config().set(
+            seq_len=seq_len,
+            query_dim=model_dim,
+            key_dim=model_dim,
+            value_dim=model_dim,
+            num_heads=num_heads,
+            query_scale=attention.ScaleQuery.default_config(),
+            atten_logit_cap=0.0,
+            dtype=jnp.float32,
+        )
+        sigmoid_attention = cfg.set(name="sigmoid_attention").instantiate(parent=None)
+        state = sigmoid_attention.initialize_parameters_recursively(prng_key=init_key)
+
+        qkv_shape = [batch_size, seq_len, num_heads, num_heads]
+        inputs = dict(
+            q_proj=jnp.full(qkv_shape, fill_value=qkv_value),
+            k_proj=jnp.full(qkv_shape, fill_value=qkv_value),
+            v_proj=jnp.full(qkv_shape, fill_value=qkv_value),
+            attention_logit_biases=attention.make_causal_mask(seq_len),
+        )
+
+        # Get outputs.
+        forward_key = jax.random.PRNGKey(456)
+
+        (_, probs), _ = F(
+            sigmoid_attention,
+            method="_compute_attention",
+            state=state,
+            is_training=False,
+            prng_key=forward_key,
+            inputs=inputs,
+        )
+
+        output_shape = [batch_size, num_heads, seq_len, seq_len]
+        indexes = jnp.arange(seq_len)
+        # Zeros outside of the causal triangle.
+        causal_mask = jax.lax.ge(indexes[:, None], indexes[None, :])
+        expected_output = jnp.full(output_shape, fill_value=expected_value) * causal_mask
+
+        self.assertNestedAllClose(probs, expected_output)
 
 
 def oracle_xl_attention_logits(
@@ -3662,35 +3738,51 @@ class StackedTransformerTest(BaseTransformerTest):
             remat_spec=build_remat_spec,
         )
 
-    def test_stack_vs_pipeline_of_stacks(self):
-        self._compare_layers(
-            StackedTransformerLayer,
-            PipelinedTransformerLayer.default_config().set(
-                stage=StackedTransformerLayer.default_config().set(layer=None)
-            ),
-        )
+    @parameterized.product(
+        stage_cls=[StackedTransformerLayer, RepeatedTransformerLayer],
+        schedule_cls=[GPipeSchedule, StreamSchedule],
+        remat_spec=[None, RematSpec(policy=jax_remat_policies.everything_saveable)],
+    )
+    def test_stack_vs_pipeline(
+        self,
+        stage_cls: Type[BaseTransformerLayer],
+        schedule_cls: Type[BaseSchedule],
+        remat_spec: Optional[RematSpec],
+    ):
+        pipelined_cfg: PipelinedTransformerLayer.Config = PipelinedTransformerLayer.default_config()
+        pipelined_cfg.stage = stage_cls.default_config().set(layer=None)
+        pipelined_cfg.pipeline.schedule = schedule_cls.default_config()
 
-    def test_stack_vs_pipeline_of_repeats(self):
-        self._compare_layers(
-            StackedTransformerLayer,
-            PipelinedTransformerLayer.default_config().set(
-                stage=RepeatedTransformerLayer.default_config().set(layer=None)
-            ),
-        )
+        # If using StreamSchedule, we expect `num_microbatches` to be divisible by `num_stages`.
+        if schedule_cls is StreamSchedule:
+            # num_microbatches = 6, num_stages = 3, microbatch_size = 2
+            batch_size, num_layers = 12, 6
+        else:
+            # num_microbatches = 5, num_stages = 3, microbatch_size = 2
+            batch_size, num_layers = 10, 6
 
-    def test_stack_vs_pipeline_remat_everything_saveable(self):
+        pipelined_cfg.num_microbatches = batch_size // 2
+        pipelined_cfg.num_stages = num_layers // 2
         self._compare_layers(
             StackedTransformerLayer,
-            PipelinedTransformerLayer,
-            remat_spec=RematSpec(policy=jax_remat_policies.everything_saveable),
+            pipelined_cfg,
+            remat_spec=remat_spec,
+            batch_size=batch_size,
+            num_layers=num_layers,
         )
 
     # pylint: disable-next=too-many-statements,too-many-branches
-    def _compare_layers(self, *stack_configs, dtype=jnp.float32, remat_spec=None):
+    def _compare_layers(
+        self,
+        *stack_configs,
+        dtype=jnp.float32,
+        remat_spec=None,
+        batch_size: int = 10,
+        num_layers: int = 6,
+    ):
         assert stack_configs[0] == StackedTransformerLayer, stack_configs[0]
         with utils.numeric_checks(False):
-            batch_size, tgt_len = 10, 5
-            num_layers, model_dim, num_heads = 6, 8, 4
+            tgt_len, model_dim, num_heads = 5, 8, 4
 
             target = jax.random.normal(
                 jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim], dtype=dtype
@@ -3713,9 +3805,6 @@ class StackedTransformerTest(BaseTransformerTest):
                     remat_spec=remat_spec,
                 )
                 cls = cfg.stack.klass
-                if cls == PipelinedTransformerLayer:
-                    cfg.stack.num_microbatches = batch_size // 2
-                    cfg.stack.num_stages = num_layers // 2
                 layer: TestStackModel = cfg.instantiate(parent=None)
 
                 param_specs = layer.create_parameter_specs_recursively()

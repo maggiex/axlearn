@@ -42,7 +42,7 @@ RUN pip install --upgrade pip
 FROM base as ci
 
 # TODO(markblee): Remove gcp,vertexai_tensorboard from CI.
-RUN pip install .[dev,gcp,vertexai_tensorboard]
+RUN pip install .[core,dev,gcp,vertexai_tensorboard]
 COPY . .
 
 # Defaults to an empty string, i.e. run pytest against all files.
@@ -74,6 +74,11 @@ FROM base AS dataflow
 ENV RUN_PYTHON_SDK_IN_DEFAULT_ENVIRONMENT=1
 RUN pip install .[gcp,dataflow]
 COPY . .
+
+# Dataflow workers can't start properly if the entrypoint is not set
+# See: https://cloud.google.com/dataflow/docs/guides/build-container-image#use_a_custom_base_image
+COPY --from=apache/beam_python3.9_sdk:2.52.0 /opt/apache/beam /opt/apache/beam
+ENTRYPOINT ["/opt/apache/beam/boot"]
 
 ################################################################################
 # TPU container spec.                                                          #
