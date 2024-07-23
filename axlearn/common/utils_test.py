@@ -174,6 +174,20 @@ class TreeUtilsTest(TestCase):
         d2 = OrderedDict(reversed(kv))
         self.assertEqual([("a", 1), ("b", 2)], sorted(flatten_items(d1)))
         self.assertEqual([("a", 1), ("b", 2)], sorted(flatten_items(d2)))
+        # Test is_leaf.
+        self.assertEqual(
+            [("a/head", 3), ("a/tail", 4), ("b", 5)],
+            flatten_items(
+                {"a": Combo(head=3, tail=4), "b": 5},
+            ),
+        )
+        self.assertEqual(
+            [("a", Combo(head=3, tail=4)), ("b", 5)],
+            flatten_items(
+                {"a": Combo(head=3, tail=4), "b": 5},
+                is_leaf=lambda x: isinstance(x, Combo),
+            ),
+        )
 
     def test_expand_vdicts(self):
         # An empty VDict is not expanded.
@@ -723,7 +737,9 @@ class _TestParentLayer(BaseLayer):
     def __init__(self, cfg: Config, *, parent: Module):
         super().__init__(cfg, parent=parent)
         cfg = self.config
-        self._add_child("child2", cfg.child2.set(input_dim=4, output_dim=5))
+        # Reuse child 2 config for child 3.
+        self._add_child("child3", cfg.child2.clone(input_dim=4, output_dim=5))
+        self._add_child("child2", cfg.child2.clone(input_dim=4, output_dim=5))
         self._add_child("child1", cfg.child1.set(input_dim=2, output_dim=3))
 
 
@@ -857,7 +873,15 @@ class ReadPerParamSettingsTest(TestCase):
                 weight_decay=5.0,
                 weight_decay_per_param_scale=per_param_scale,
             )
-            trainer_cfg.learner = learner.Learner.default_config().set(optimizer=optimizer_cfg)
+            trainer_cfg.learner = learner.Learner.default_config().set(
+                optimizer=optimizer_cfg,
+                # Also test that read_per_param_settings does not include optimizer settings for
+                # parameters that the learner does not update.
+                update_rules=[
+                    (".*child(1|3).*", learner.UpdateType.ALL_UPDATES),
+                    (".*child2.*", learner.UpdateType.NO_UPDATE),
+                ],
+            )
             return trainer_cfg
 
         # pylint: disable-next=attribute-defined-outside-init
@@ -865,8 +889,12 @@ class ReadPerParamSettingsTest(TestCase):
         weight_decays = read_per_param_settings(module=self, config_name="test")
         self.assertIn("weight_decay_scale", weight_decays)
         self.assertDictEqual(
-            dict(child1=dict(weight=1.0, bias=0.0), child2=dict(weight=1.0, bias=0.0)),
-            weight_decays["weight_decay_scale"]["root"],
+            dict(
+                child1=dict(weight=1.0, bias=0.0),
+                child2=dict(weight=None, bias=None),
+                child3=dict(weight=1.0, bias=0.0),
+            ),
+            weight_decays["weight_decay_scale"]["root.optimizer"],
         )
 
     @parameterized.parameters(0.0, 3.5)
@@ -898,7 +926,7 @@ class ReadPerParamSettingsTest(TestCase):
             self.assertIn("l2_regularizer_scale", settings)
             self.assertDictEqual(
                 dict(bias=0.0, scale=1.0, moving_mean=0.0, moving_variance=0.0),
-                settings["l2_regularizer_scale"]["root"],
+                settings["l2_regularizer_scale"]["root.optimizer"],
             )
         else:
             self.assertNotIn("l2_regularizer_scale", settings)
@@ -932,7 +960,7 @@ class ReadPerParamSettingsTest(TestCase):
         self.assertIn("l2_regularizer_scale", settings)
         self.assertDictEqual(
             dict(layer=dict(bias=1.0, scale=0.0)),
-            settings["l2_regularizer_scale"]["root"],
+            settings["l2_regularizer_scale"]["root.optimizer"],
         )
 
     def test_two_per_param_scales(self):
@@ -977,10 +1005,14 @@ class ReadPerParamSettingsTest(TestCase):
         settings = read_per_param_settings(module=self, config_name="test")
         # l2_per_param_scale.
         self.assertIn("l2_regularizer_scale", settings)
-        self.assertDictEqual({"bias": 0.0, "weight": 1.0}, settings["l2_regularizer_scale"]["root"])
+        self.assertDictEqual(
+            {"bias": 0.0, "weight": 1.0}, settings["l2_regularizer_scale"]["root.optimizer"]
+        )
         # freeze_per_param_scale.
         self.assertIn("update_scale", settings)
-        self.assertDictEqual({"bias": 1.0, "weight": 0.0}, settings["update_scale"]["root"])
+        self.assertDictEqual(
+            {"bias": 1.0, "weight": 0.0}, settings["update_scale"]["root.optimizer"]
+        )
 
     def test_learner_update_types(self):
         def config_fn():
@@ -1047,7 +1079,11 @@ class ReadPerParamSettingsTest(TestCase):
                     ),
                     "learner2": learner.Learner.default_config().set(optimizer=opt2_cfg),
                 },
-                rules=[("child1.*", "learner1"), ("child2.*", "learner2")],
+                rules=[
+                    ("child1.*", "learner1"),
+                    ("child2.*", "learner2"),
+                    ("child3.*", "learner2"),
+                ],
             )
             return trainer_cfg
 
@@ -1066,7 +1102,11 @@ class ReadPerParamSettingsTest(TestCase):
         # The learner rule per_param_settings. Parameters of child 1 are mapped to learner1, and
         # parameters of child 2 are mapped to learner2.
         self.assertDictEqual(
-            dict(child1=dict(weight="learner1"), child2=dict(weight="learner2", bias="learner2")),
+            dict(
+                child1=dict(weight="learner1"),
+                child2=dict(weight="learner2", bias="learner2"),
+                child3=dict(bias="learner2", weight="learner2"),
+            ),
             all_per_param_settings["learner_rule"]["learner"],
         )
 
@@ -1083,7 +1123,10 @@ class ReadPerParamSettingsTest(TestCase):
             dict(
                 child2=dict(
                     weight=learner.UpdateType.ALL_UPDATES, bias=learner.UpdateType.ALL_UPDATES
-                )
+                ),
+                child3=dict(
+                    weight=learner.UpdateType.ALL_UPDATES, bias=learner.UpdateType.ALL_UPDATES
+                ),
             ),
             all_per_param_settings["learner_update_type"]["learner.learner2"],
         )
@@ -1094,18 +1137,18 @@ class ReadPerParamSettingsTest(TestCase):
             # thus has weight_decay as None. child2 is pruned.
             dict(child1=dict(weight=None)),
             # The key is determined from current_context, thus `root.learner1`.
-            all_per_param_settings["weight_decay_scale"]["root.learner1"],
+            all_per_param_settings["weight_decay_scale"]["root.learner1.optimizer"],
         )
         # In learner2's weight_decay_scale, parameters associated with learner1 are pruned.
         self.assertDictEqual(
             # child1 is pruned.
-            dict(child2=dict(weight=1.0, bias=1.0)),
-            all_per_param_settings["weight_decay_scale"]["root.learner2"],
+            dict(child2=dict(weight=1.0, bias=1.0), child3=dict(weight=1.0, bias=1.0)),
+            all_per_param_settings["weight_decay_scale"]["root.learner2.optimizer"],
         )
         # update scale has 1 entry from learner2.
         self.assertDictEqual(
-            dict(child2={"bias": 0.0, "weight": 1.0}),
-            all_per_param_settings["update_scale"]["root.learner2"],
+            dict(child2=dict(bias=0.0, weight=1.0), child3=dict(bias=0.0, weight=1.0)),
+            all_per_param_settings["update_scale"]["root.learner2.optimizer"],
         )
 
 
