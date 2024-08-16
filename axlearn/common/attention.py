@@ -45,7 +45,19 @@ import enum
 import functools
 import math
 from enum import Enum, unique
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import jax
 from jax import numpy as jnp
@@ -88,6 +100,7 @@ from axlearn.common.pipeline import Pipeline
 from axlearn.common.quantized_dot_general.layers import DenseGeneralBaseLayer
 from axlearn.common.repeat import Repeat
 from axlearn.common.utils import (
+    Nested,
     NestedTensor,
     PartitionSpec,
     Tensor,
@@ -1052,10 +1065,10 @@ class FusedQKVLinear(BaseQKVLinear):
         )
 
     def initialize_parameters_recursively(
-        self, prng_key: Tensor, *, prebuilt: Optional[NestedTensor] = None
+        self, prng_key: Tensor, *, prebuilt: Optional[Nested[Optional[ParameterSpec]]] = None
     ) -> NestedTensor:
         if self._use_prebuilt_params(prebuilt):
-            return prebuilt
+            return jax.tree_util.tree_map(lambda _: None, prebuilt)
 
         def init(prng_key_i):
             return VDict(qkv_proj=self.qkv_proj.initialize_parameters_recursively(prng_key_i))
@@ -1731,21 +1744,14 @@ class MultiheadAttention(BaseLayer):
             # [batch, 1, target_length, source_length].
             attention_logit_biases = attention_logit_biases[:, None, :, :]
         if cfg.causal:
-            if mode in (ForwardMode.FORWARD, ForwardMode.INIT_STATES):
-                causal_mask = self._causal_mask(seq_len=q_proj.shape[1])
-            elif mode == ForwardMode.EXTEND_STEP:
-                # [batch], representing query time_step.
+            if mode == ForwardMode.EXTEND_STEP:
+                seq_len = k_proj.shape[1]
                 time_step = cached_states["i_proj"]["time_step"]
-                kv_len = k_proj.shape[1]
-                indexes = jnp.arange(kv_len)
-                # [batch, 1, 1, kv_len].
-                # causal_mask[b, :, :, kv_pos] = 0 if kv_pos <= time_step[b] else NEG_INF.
-                causal_mask = (
-                    jax.lax.lt(time_step[:, None, None, None], indexes[None, None, None, :])
-                    * NEG_INF
-                )
             else:
-                raise ValueError(f"Unrecognized mode {mode}.")
+                seq_len = q_proj.shape[1]
+                time_step = None
+            causal_mask = self._causal_mask(mode=mode, seq_len=seq_len, time_step=time_step)
+
             if causal_mask is not None:
                 attention_logit_biases = apply_attention_logit_biases(
                     causal_mask.astype(q_proj.dtype),
@@ -1772,14 +1778,29 @@ class MultiheadAttention(BaseLayer):
         )
         return dict(i_proj=i_proj_state), output
 
-    def _causal_mask(self, seq_len: int) -> Optional[Tensor]:
-        """Returns a causal mask that can be broadcasted to [batch, num_heads, seq_len, seq_len].
+    def _causal_mask(
+        self, *, mode: ForwardMode, seq_len: int, time_step: Optional[Tensor] = None
+    ) -> Optional[Tensor]:
+        """Returns a causal mask.
 
         ... or None if the implementation of _compute_attention supports the causal mode natively.
 
-        Only used for (ForwardMode.FORWARD, ForwardMode.INIT_STATES).
+        For (ForwardMode.FORWARD, ForwardMode.INIT_STATES), the mask can be broadcast to
+        [batch, num_heads, seq_len, seq_len].
+
+        For ForwardMode.EXTEND_STEP, the mask can be broadcast to [batch, num_heads, 1, seq_len].
         """
-        return make_causal_mask(seq_len)[None, None, :, :]
+        if mode in (ForwardMode.FORWARD, ForwardMode.INIT_STATES):
+            return make_causal_mask(seq_len)[None, None, :, :]
+        elif mode == ForwardMode.EXTEND_STEP:
+            indexes = jnp.arange(seq_len)
+            # [batch, 1, 1, kv_len].
+            # causal_mask[b, :, :, kv_pos] = 0 if kv_pos <= time_step[b] else NEG_INF.
+            return (
+                jax.lax.lt(time_step[:, None, None, None], indexes[None, None, None, :]) * NEG_INF
+            )
+        else:
+            raise ValueError(f"Unrecognized mode {mode}.")
 
     def _compute_attention(
         self,
@@ -2005,11 +2026,11 @@ class GroupedQueryAttention(MultiheadAttention):
 
     def _repeat_kv_heads(self, key_or_value: Tensor) -> Tensor:
         """Repeats key or value heads dim to match the query."""
-        num_head_repeats = self.config.num_heads // key_or_value.shape[2]
+        num_head_repeats = self.config.num_heads // key_or_value.shape[-2]
         if num_head_repeats == 1:
             return key_or_value
         # Repeat along the num_heads dim: [batch, source_length, num_heads, per_head_dim].
-        return jnp.repeat(key_or_value, num_head_repeats, axis=2)
+        return jnp.repeat(key_or_value, num_head_repeats, axis=-2)
 
     def _compute_attention(
         self,
@@ -3012,6 +3033,9 @@ class TransformerLayer(BaseTransformerLayer):
             cross_attention_probs = None
         data = self.feed_forward(data)
         self.vlog(3, "transformer.output=%s", data.sum())
+        # TODO(markblee): Support module outputs in decoding.
+        if mode == ForwardMode.FORWARD:
+            self.add_module_output("output", data)
         return dict(self_attention=self_atten_state), BaseTransformerLayer.Output(
             data=data,
             self_attention_probs=self_atten_outputs.probs,
@@ -3402,7 +3426,7 @@ class StackedTransformerLayer(BaseStackedTransformerLayer):
             self._layers.append(self._add_child(f"layer{i}", layer_cfg))
 
     def initialize_parameters_recursively(
-        self, prng_key: Tensor, *, prebuilt: Optional[NestedTensor] = None
+        self, prng_key: Tensor, *, prebuilt: Optional[Nested[Optional[ParameterSpec]]] = None
     ) -> NestedTensor:
         cfg = self.config  # type: StackedTransformerLayer.Config
         prng_key = split_prng_key(prng_key, cfg.num_layers)
@@ -3442,6 +3466,9 @@ class StackedTransformerLayer(BaseStackedTransformerLayer):
         all_layer_outputs = []
         all_layer_states = []
         for i, layer in enumerate(self._layers):
+            # Prepare inputs to the current layer.
+            self._update_layer_kwargs(layer_kwargs, all_layer_outputs=all_layer_outputs)
+
             if mode == ForwardMode.FORWARD:
                 layer_states, layer_outputs = None, layer(data, **layer_kwargs)
             elif mode == ForwardMode.INIT_STATES:
@@ -3463,14 +3490,25 @@ class StackedTransformerLayer(BaseStackedTransformerLayer):
             all_layer_outputs.append(layer_outputs)
             all_layer_states.append(layer_states)
             data = layer_outputs.data
-            # Prepare inputs to the next layer.
-            self._update_layer_kwargs(layer_kwargs, outputs=layer_outputs)
 
         return all_layer_states, self._aggregate_layer_outputs(all_layer_outputs)
 
     def _update_layer_kwargs(
-        self, layer_kwargs: Dict[str, Any], *, outputs: BaseTransformerLayer.Output
+        self,
+        layer_kwargs: Dict[str, Any],
+        *,
+        all_layer_outputs: List[BaseTransformerLayer.Output],
     ):
+        """Updates `layer_kwargs` using other args.
+
+        This method is called before we invoke each layer in `self._layers`.
+        The updated `layer_kwargs` will be passed to the layer invocation.
+
+        Args:
+            layer_kwargs: a dictionary of arguments that can be used by individual layers.
+            all_layer_outputs: a list of BaseTransformerLayer.Output that is appended with
+                the output of each constituent layer in the stack.
+        """
         pass  # Do nothing by default.
 
     def _aggregate_layer_outputs(
@@ -3821,7 +3859,7 @@ class PipelinedTransformerLayer(BaseStackedTransformerLayer):
         self._add_child("pipeline", pipeline_cfg)
 
     def initialize_parameters_recursively(
-        self, prng_key: Tensor, *, prebuilt: Optional[NestedTensor] = None
+        self, prng_key: Tensor, *, prebuilt: Optional[Nested[Optional[ParameterSpec]]] = None
     ) -> NestedTensor:
         cfg = self.config  # type: PipelinedTransformerLayer.Config
         # We pre-split all num_layers keys to ensure initialization parity with
@@ -3859,6 +3897,7 @@ def build_remat_spec(
     ],
     self_attention: bool = True,
     feed_forward: bool = False,
+    offload_dst: Optional[Literal["pinned_host"]] = None,
 ) -> Optional[RematSpec]:
     """Configures how the Transformer or Conformer stack will save the linearization points.
 
@@ -3876,6 +3915,8 @@ def build_remat_spec(
         stack_cfg: A transformer config.
         self_attention: Checkpoint self attention layer activations if true.
         feed_forward: Checkpoint feed-forward layer activations if true.
+        offload_dst: Destination of remat checkptoing offloading. Relevant Maxtext example:
+          https://github.com/google/maxtext/blob/ebd39aa64d670fa13a313b6f776e01ad9e450321/MaxText/layers/models.py#L230.
 
     Returns:
         None (if no rematerialization is needed) or a RematSpec.
@@ -3890,17 +3931,27 @@ def build_remat_spec(
         checkpoints.extend(
             [f"{attention_name}.{el}" for el in ["q_proj", "k_proj", "v_proj", "context", "o_proj"]]
         )
+
     if feed_forward and hasattr(stack_cfg.layer, "feed_forward"):
         ffn_name = stack_cfg.layer.feed_forward.klass.__name__
         checkpoints.extend([f"{ffn_name}.{el}" for el in ["activation", "linear2"]])
+
+    policy = config_for_function(jax_remat_policies.save_only_these_names).set(
+        names_which_can_be_saved=checkpoints
+    )
+    if offload_dst:
+        policy = config_for_function(jax_remat_policies.save_and_offload_only_these_names).set(
+            names_which_can_be_saved=[],
+            names_which_can_be_offloaded=checkpoints,
+            offload_src="device",
+            offload_dst=offload_dst,
+        )
 
     return RematSpec(
         prevent_cse=stack_cfg.klass is StackedTransformerLayer,
         # If we are running inside a jax.lax.scan (Repeated/Pipelined transformers
         # or Repeated Conformers) we can enable common subexpression elimination optimizations.
-        policy=config_for_function(jax_remat_policies.save_only_these_names).set(
-            names_which_can_be_saved=checkpoints
-        ),
+        policy=policy,
     )
 
 

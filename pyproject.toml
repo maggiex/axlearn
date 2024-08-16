@@ -89,6 +89,7 @@ gcp = [
     "google-auth[pyopenssl]",  # Ensures that we have compatible pyopenssl/cryptography pins.
     "google-cloud-storage==2.16.0",
     "google-cloud-core==2.3.3",
+    "google-cloud-build==3.24.1",
     "ml_goodput_measurement==0.0.2",
     "pyOpenSSL>=22.1.0",  # compat with cryptography version.
 ]
@@ -123,6 +124,16 @@ gpu = [
 # Open API inference.
 open_api = [
     "openai==1.35.1",
+]
+# MMAU benchmark.
+mmau = [
+    "openai==1.35.14",
+    "anthropic==0.31.2",
+    "nbformat==5.10.4",
+    "plotly==5.22.0",
+    "nbconvert==7.16.4",
+    "google-cloud-aiplatform==1.50.0",
+    "transformers==4.42.4",
 ]
 
 [tool.flit.module]

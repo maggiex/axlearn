@@ -16,6 +16,7 @@
 
 import contextlib
 import copy
+import itertools
 
 # pylint: disable=too-many-lines,duplicate-code,no-self-use
 import math
@@ -112,6 +113,14 @@ from axlearn.common.utils import (
     flatten_items,
     shapes,
 )
+
+
+def all_subsets(given_set):
+    "Generate all subsets of a list `given_set`."
+    s = list(given_set)
+    return list(
+        itertools.chain.from_iterable(itertools.combinations(s, r) for r in range(len(s) + 1))
+    )
 
 
 def _random_mask(prng_key, tgt_len, src_len):
@@ -3127,12 +3136,13 @@ class TransformerTest(BaseTransformerTest):
         for mask in (None, null_mask, rand_mask):
             if mask is not None:
                 mask = jnp.tile(mask[None, None, :, :], (batch_size, num_heads, 1, 1))
-            layer_outputs, _ = F(
+            layer_outputs, output_collection = F(
                 layer,
                 inputs=dict(data=jnp.asarray(target), self_attention_logit_biases=mask),
                 state=layer_params,
                 is_training=True,
                 prng_key=jax.random.PRNGKey(0),
+                drop_output_collections=(),
             )
             if layer_outputs.self_attention_probs is not None:
                 self.assertEqual(
@@ -3146,6 +3156,7 @@ class TransformerTest(BaseTransformerTest):
                 output_attentions=False,
             )
             assert_allclose(layer_outputs.data, as_tensor(ref_outputs))
+            self.assertNestedEqual(layer_outputs.data, output_collection.module_outputs["output"])
 
     def test_against_roberta_layer(self):
         model_dim = 16
@@ -3388,6 +3399,22 @@ class NonUniformStack(StackedTransformerLayer):
             self_attention_probs=None,
             cross_attention_probs=None,
         )
+
+
+class TestStackedTransformerLayerWithKVState(NonUniformStack):
+    """A class with a simple override of _update_layer_kwargs for unit testing."""
+
+    def _update_layer_kwargs(
+        self,
+        layer_kwargs: Dict[str, Any],
+        *,
+        all_layer_outputs: List[BaseTransformerLayer.Output],
+    ):
+        layer_index = len(all_layer_outputs)
+        if layer_index == 1:
+            layer_kwargs["self_attention_kv_state"] = all_layer_outputs[-1].self_attention_kv_state
+        elif layer_index == 2:
+            layer_kwargs["self_attention_kv_state"] = None
 
 
 class StackedTransformerTest(BaseTransformerTest):
@@ -3713,6 +3740,53 @@ class StackedTransformerTest(BaseTransformerTest):
         assert_allclose(decoder_output, forward_outputs.data)
         assert_allclose(decoder_self_attention_probs, forward_outputs.self_attention_probs)
         assert_allclose(decoder_cross_attention_probs, forward_outputs.cross_attention_probs)
+
+    def test_update_layer_kwargs(self):
+        batch_size = 2
+        seq_len = 6
+        num_heads = 2
+        input_dim = 4
+        per_head_dim = input_dim // num_heads
+        hidden_dim = 8
+        num_layers = 3
+
+        # Create a StackedTransformerLayer by specifying a sequence of non-uniform layer configs.
+        cfg = TestStackedTransformerLayerWithKVState.default_config().set(name="test")
+        cfg.input_dim = input_dim
+        cfg.num_layers = num_layers
+        cfg.layer = []
+        for i in range(num_layers):
+            transformer_cfg = TransformerLayer.default_config()
+            transformer_cfg.self_attention.attention.num_heads = num_heads
+            transformer_cfg.feed_forward.hidden_dim = hidden_dim
+
+            if i == 1:
+                transformer_cfg.self_attention.attention.input_linear = QLinear.default_config()
+
+            cfg.layer.append(transformer_cfg)
+
+        layer: StackedTransformerLayer = cfg.instantiate(parent=None)
+        inputs = jax.random.uniform(jax.random.PRNGKey(1), shape=(batch_size, seq_len, input_dim))
+        state = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
+        outputs, _ = F(
+            layer,
+            is_training=True,
+            prng_key=jax.random.PRNGKey(123),
+            state=state,
+            inputs=dict(data=inputs, return_aux={"self_attention_kv_state"}),
+        )
+        self.assertEqual(
+            BaseTransformerLayer.Output(
+                data=(batch_size, seq_len, input_dim),
+                self_attention_probs=None,
+                self_attention_kv_state=KVState(
+                    k_proj=(batch_size, seq_len, num_heads, per_head_dim),
+                    v_proj=(batch_size, seq_len, num_heads, per_head_dim),
+                ),
+                cross_attention_probs=None,
+            ),
+            shapes(outputs),
+        )
 
     def test_stack_vs_repeat(self):
         self._compare_layers(StackedTransformerLayer, RepeatedTransformerLayer)
@@ -4198,6 +4272,68 @@ class StackedTransformerTest(BaseTransformerTest):
             self.assertNestedAllClose(data, out.data)
             self.assertIsNone(out.self_attention_probs)
             self.assertIsNotNone(out.self_attention_kv_state)
+
+    @parameterized.parameters(
+        ([],),
+        (["self_attention"],),
+        (["feed_forward"],),
+        (["self_attention", "feed_forward"],),
+    )
+    def test_initialize_parameters_recursively(self, prebuilt_layers: List[str]):
+        """Tests initialize_parameters_recursively with various prebuilt layers."""
+        input_dim = 4
+        num_heads = 2
+        num_layers = 3
+
+        cfg = self._stack_config(
+            RepeatedTransformerLayer,
+            num_layers=num_layers,
+            model_dim=input_dim,
+            num_heads=num_heads,
+            dtype=jnp.float32,
+            remat_spec=None,
+            output_self_attention_kv_state=True,
+        )
+        cfg.stack.layer.remat_spec = build_remat_spec(
+            cfg.stack, self_attention=True, feed_forward=True
+        )
+        layer = cfg.instantiate(parent=None)
+        param_specs = layer.create_parameter_specs_recursively()
+        initialized_from_scratch = layer.initialize_parameters_recursively(
+            prng_key=jax.random.PRNGKey(123)
+        )
+        jax.tree_util.tree_map_with_path(
+            lambda path, spec, param: self.assertEqual(param.shape, spec.shape, path),
+            param_specs,
+            initialized_from_scratch,
+        )
+
+        def has_prebuilt_layers(path):
+            for prebuilt_layer in prebuilt_layers:
+                for part in path:
+                    if prebuilt_layer == part.key:
+                        return True
+            return False
+
+        # ParameterSpec for a prebuilt param, None otherwise.
+        prebuilt_specs = jax.tree_util.tree_map_with_path(
+            lambda path, spec: spec if has_prebuilt_layers(path) else None, param_specs
+        )
+        if prebuilt_layers:
+            self.assertNotEmpty(jax.tree_util.tree_leaves(prebuilt_specs))
+        initialized_state = layer.initialize_parameters_recursively(
+            prng_key=jax.random.PRNGKey(123), prebuilt=prebuilt_specs
+        )
+
+        def validate_initialized(path, spec, initialized, prebuilt):
+            if prebuilt is None:
+                self.assertEqual(spec.shape, initialized.shape, path)
+            else:
+                self.assertIsNone(initialized)
+
+        jax.tree_util.tree_map_with_path(
+            validate_initialized, param_specs, initialized_state, prebuilt_specs
+        )
 
 
 class ConfigHelperTest(TestCase):

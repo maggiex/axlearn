@@ -151,15 +151,17 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
         with mock_get_vm_node:
             # Test with defaults.
             job = self._mock_config().instantiate()
-            job._execute()
+            job_spec = job._execute()
+            self.assertIsNotNone(job_spec)
 
             # Test with bundler.
             mock_bundler = mock.MagicMock()
             cfg = self._mock_config()
             cfg.runner.bundler = config_for_function(lambda: mock_bundler)
             job = cfg.instantiate()
-            job._execute()
+            job_spec = job._execute()
             self.assertTrue(mock_bundler.bundle.called)
+            self.assertIsNotNone(job_spec)
 
             # Test with invalid project id.
             project_id = "test_project"
@@ -213,7 +215,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                         job_id="test-id1",
                     ),
                 ),
-                state=BastionJobState(status=JobStatus.ACTIVE),
+                state=BastionJobState(status=JobStatus.ACTIVE, metadata={"tier": 1}),
                 command_proc=None,
                 cleanup_proc=None,
             ),
@@ -229,7 +231,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                         job_id="test-id2",
                     ),
                 ),
-                state=BastionJobState(status=JobStatus.ACTIVE),
+                state=BastionJobState(status=JobStatus.ACTIVE, metadata={"tier": 0}),
                 command_proc=None,
                 cleanup_proc=None,
             ),
@@ -249,6 +251,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                         "RESOURCES",
                         "PRIORITY",
                         "JOB_ID",
+                        "TIER",
                     ],
                     rows=[
                         [
@@ -259,6 +262,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                             "{'v4': 8}",
                             "5",
                             "test-id0",
+                            "None",
                         ],
                         [
                             "test_job1",
@@ -268,6 +272,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                             "{'v4': 8, 'v5': 16}",
                             "5",
                             "test-id1",
+                            "1",
                         ],
                         [
                             "test_job2",
@@ -277,6 +282,7 @@ class TestBaseBastionManagedJob(parameterized.TestCase):
                             "{'v4': 16}",
                             "5",
                             "test-id2",
+                            "0",
                         ],
                     ],
                 ),
@@ -625,9 +631,10 @@ class TestBastionManagedGKEJob(TestWithTemporaryCWD):
 
         with ctx, patch_kube_config, patch_execute as mock_execute:
             job: BastionManagedGKEJob = cfg.instantiate()
-            job._execute()
+            job_spec = job._execute()
 
             if isinstance(expected, Exception):
                 mock_execute.assert_not_called()
             else:
                 mock_execute.assert_called_once()
+                self.assertIsNotNone(job_spec)
